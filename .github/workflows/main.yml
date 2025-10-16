@@ -1,53 +1,55 @@
-name: RDP Linux
+name: Linux Remote Desktop
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-linux:
+  linux-rdp:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Install XFCE and RDP
+      - name: Setup Environment
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 \
-            xfce4-goodies \
-            xrdp \
-            chromium-browser \
-            firefox
+          sudo apt-get install -y xfce4 xrdp firefox-esr
 
-      - name: Configure XRDP
+      - name: Create User Account
         run: |
-          # Configure XRDP to use XFCE
-          echo xfce4-session > ~/.xsession
+          # Safe password generation
+          PASSWORD=$(date +%s | sha256sum | base64 | head -c 12)
+          echo "USER_PASSWORD=$PASSWORD" >> $GITHUB_ENV
           
-          # Create XRDP config
-          sudo tee /etc/xrdp/xrdp.ini > /dev/null <<EOF
-          [globals]
-          bitmap_cache=yes
-          bitmap_compression=yes
-          port=3389
-          crypt_level=low
-          channel_code=1
-          max_bpp=24
+          sudo useradd -m -s /bin/bash linuxuser
+          echo "linuxuser:$PASSWORD" | sudo chpasswd
+          sudo usermod -a -G sudo linuxuser
 
-          [xrdp1]
-          name=sesman-Xvnc
-          lib=libvnc.so
-          username=ask
-          password=ask
-          ip=127.0.0.1
-          port=-1
-          EOF
-
-      - name: Create RDP User with Secure Password
+      - name: Setup Tailscale
         run: |
-          # Generate secure password
-          PASSWORD=$(openssl rand -base64 32 | tr -d '/+' | cut -c1-16)
-          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
-          
-          # Create user
-          sudo useradd -m -
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscaled --state=mem: &
+          sleep 15
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=linux-rdp-$GITHUB_RUN_ID
+          echo "TS_IP=$(sudo tailscale ip -4)" >> $GITHUB_ENV
+
+      - name: Start RDP
+        run: |
+          sudo xrdp-sesman &
+          sudo xrdp &
+          sleep 3
+
+      - name: Display Info
+        run: |
+          echo "✅ REMOTE DESKTOP READY"
+          echo "========================"
+          echo "IP: $TS_IP"
+          echo "User: linuxuser"
+          echo "Password: $USER_PASSWORD"
+          echo "========================"
+
+      - name: Keep Running
+        run: |
+          while true; do
+            sleep 300
+            echo "🟢 Active - $(date +%H:%M:%S)"
+          done
