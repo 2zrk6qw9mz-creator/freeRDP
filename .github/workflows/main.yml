@@ -1,37 +1,171 @@
-name: Simple Ubuntu RDP
+name: Debian 12 RDP + SSH with Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  ubuntu-rdp:
+  debian-rdp-ssh:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    container:
+      image: debian:bookworm-slim
+      options: --privileged
 
     steps:
-      - name: Install XFCE and RDP
+      - name: Update system and install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y xfce4 xrdp firefox
+          apt-get update
+          apt-get install -y sudo curl wget openssh-server netcat
 
-      - name: Create User
+      - name: Install desktop environment
         run: |
-          sudo useradd -m -s /bin/bash ubuntuuser
-          echo "ubuntuuser:password123" | sudo chpasswd
-          sudo usermod -a -G sudo ubuntuuser
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 \
+            xfce4-goodies \
+            xorg \
+            xrdp \
+            firefox-esr \
+            dbus-x11
 
-      - name: Start RDP
+      - name: Create user and generate passwords
         run: |
-          sudo xrdp-sesman &
-          sudo xrdp &
-          sleep 3
-          echo "RDP started on port 3389"
+          # Generate secure passwords
+          USER_PASSWORD=$(openssl rand -base64 12 | tr -d '/+' | cut -c1-12)
+          echo "USER_PASSWORD=$USER_PASSWORD" >> $GITHUB_ENV
+          
+          # Create user
+          useradd -m -s /bin/bash debianuser
+          echo "debianuser:$USER_PASSWORD" | chpasswd
+          usermod -a -G sudo debianuser
+          
+          # Setup RDP session
+          echo 'xfce4-session' > /home/debianuser/.xsession
+          chown debianuser:debianuser /home/debianuser/.xsession
 
-      - name: Show Info
+      - name: Configure SSH server
         run: |
-          echo "User: ubuntuuser"
-          echo "Password: password123"
-          echo "Connect via RDP to this machine"
+          # Generate SSH keys
+          ssh-keygen -A
+          
+          # Configure SSH
+          echo "Port 2222" >> /etc/ssh/sshd_config
+          echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+          echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+          echo "X11Forwarding yes" >> /etc/ssh/sshd_config
 
-      - name: Keep Running
-        run: sleep 3600
+      - name: Configure XRDP
+        run: |
+          cat > /etc/xrdp/startwm.sh << 'EOF'
+#!/bin/bash
+if [ -r /etc/default/locale ]; then
+  . /etc/default/locale
+  export LANG LANGUAGE
+fi
+startxfce4
+EOF
+          chmod +x /etc/xrdp/startwm.sh
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start Tailscale and get IP
+        run: |
+          # Start tailscaled
+          tailscaled --state=mem: &
+          sleep 10
+          
+          # Connect to Tailscale
+          tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=debian12-rdp-ssh-$GITHUB_RUN_ID
+          
+          # Get IP
+          TS_IP=$(tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "✅ Tailscale IP: $TS_IP"
+
+      - name: Start services
+        run: |
+          # Start DBUS
+          dbus-daemon --system --fork
+          sleep 2
+          
+          # Start SSH
+          /usr/sbin/sshd -p 2222 &
+          sleep 2
+          
+          # Start RDP
+          xrdp-sesman &
+          sleep 2
+          xrdp &
+          sleep 5
+          
+          # Verify services
+          echo "🔍 Checking services..."
+          if ps aux | grep -q [s]shd; then
+            echo "✅ SSH server running on port 2222"
+          else
+            echo "❌ SSH server not running"
+          fi
+          
+          if ps aux | grep -q [x]rdp; then
+            echo "✅ RDP server running on port 3389"
+          else
+            echo "❌ RDP server not running"
+          fi
+
+      - name: Display connection information
+        run: |
+          echo ""
+          echo "=================================================="
+          echo "🖥️  DEBIAN 12 RDP + SSH - READY!"
+          echo "=================================================="
+          echo "📍 Tailscale IP: $TAILSCALE_IP"
+          echo "👤 Username: debianuser"
+          echo "🔑 Password: $USER_PASSWORD"
+          echo ""
+          echo "🔌 RDP Connection (Port 3389):"
+          echo "rdesktop -u debianuser -p $USER_PASSWORD $TAILSCALE_IP"
+          echo "OR"
+          echo "xfreerdp /u:debianuser /p:$USER_PASSWORD /v:$TAILSCALE_IP"
+          echo ""
+          echo "🖧 SSH Connection (Port 2222):"
+          echo "ssh -p 2222 debianuser@$TAILSCALE_IP"
+          echo ""
+          echo "📁 X11 Forwarding via SSH:"
+          echo "ssh -X -p 2222 debianuser@$TAILSCALE_IP"
+          echo ""
+          echo "🐧 OS: Debian 12 (Bookworm)"
+          echo "🖼️  Desktop: XFCE"
+          echo "🌐 Browser: Firefox ESR"
+          echo "=================================================="
+          echo ""
+
+      - name: Keep session alive
+        run: |
+          echo "🔄 Session active for 1 hour. Monitoring services..."
+          COUNTER=0
+          while [ $COUNTER -lt 72 ]; do
+            MINUTES=$((COUNTER * 5))
+            
+            # Check services
+            SSH_RUNNING=$(ps aux | grep -q [s]shd && echo "✅" || echo "❌")
+            RDP_RUNNING=$(ps aux | grep -q [x]rdp && echo "✅" || echo "❌")
+            TAILSCALE_RUNNING=$(tailscale status >/dev/null 2>&1 && echo "✅" || echo "❌")
+            
+            echo "[${MINUTES}m] Services: SSH:${SSH_RUNNING} RDP:${RDP_RUNNING} Tailscale:${TAILSCALE_RUNNING}"
+            
+            # Restart services if needed
+            if ! ps aux | grep -q [s]shd; then
+              echo "🔄 Restarting SSH server..."
+              /usr/sbin/sshd -p 2222 &
+            fi
+            
+            if ! ps aux | grep -q [x]rdp; then
+              echo "🔄 Restarting RDP server..."
+              xrdp-sesman &
+              sleep 2
+              xrdp &
+            fi
+            
+            sleep 300
+            COUNTER=$((COUNTER + 1))
+          done
