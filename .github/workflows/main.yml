@@ -1,0 +1,53 @@
+name: RDP Linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Install XFCE and RDP
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 \
+            xfce4-goodies \
+            xrdp \
+            chromium-browser \
+            firefox
+
+      - name: Configure XRDP
+        run: |
+          # Configure XRDP to use XFCE
+          echo xfce4-session > ~/.xsession
+          
+          # Create XRDP config
+          sudo tee /etc/xrdp/xrdp.ini > /dev/null <<EOF
+          [globals]
+          bitmap_cache=yes
+          bitmap_compression=yes
+          port=3389
+          crypt_level=low
+          channel_code=1
+          max_bpp=24
+
+          [xrdp1]
+          name=sesman-Xvnc
+          lib=libvnc.so
+          username=ask
+          password=ask
+          ip=127.0.0.1
+          port=-1
+          EOF
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # Generate secure password
+          PASSWORD=$(openssl rand -base64 32 | tr -d '/+' | cut -c1-16)
+          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
+          
+          # Create user
+          sudo useradd -m -
