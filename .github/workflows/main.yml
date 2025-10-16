@@ -1,55 +1,37 @@
-name: Linux Remote Desktop
+name: Simple Ubuntu RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  linux-rdp:
+  ubuntu-rdp:
     runs-on: ubuntu-latest
-    timeout-minutes: 3600
+    timeout-minutes: 60
 
     steps:
-      - name: Setup Environment
+      - name: Install XFCE and RDP
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xfce4 xrdp firefox-esr
+          sudo apt update
+          sudo apt install -y xfce4 xrdp firefox
 
-      - name: Create User Account
+      - name: Create User
         run: |
-          # Safe password generation
-          PASSWORD=$(date +%s | sha256sum | base64 | head -c 12)
-          echo "USER_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-          
-          sudo useradd -m -s /bin/bash linuxuser
-          echo "linuxuser:$PASSWORD" | sudo chpasswd
-          sudo usermod -a -G sudo linuxuser
-
-      - name: Setup Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscaled --state=mem: &
-          sleep 15
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=linux-rdp-$GITHUB_RUN_ID
-          echo "TS_IP=$(sudo tailscale ip -4)" >> $GITHUB_ENV
+          sudo useradd -m -s /bin/bash ubuntuuser
+          echo "ubuntuuser:password123" | sudo chpasswd
+          sudo usermod -a -G sudo ubuntuuser
 
       - name: Start RDP
         run: |
           sudo xrdp-sesman &
           sudo xrdp &
           sleep 3
+          echo "RDP started on port 3389"
 
-      - name: Display Info
+      - name: Show Info
         run: |
-          echo "✅ REMOTE DESKTOP READY"
-          echo "========================"
-          echo "IP: $TS_IP"
-          echo "User: linuxuser"
-          echo "Password: $USER_PASSWORD"
-          echo "========================"
+          echo "User: ubuntuuser"
+          echo "Password: password123"
+          echo "Connect via RDP to this machine"
 
       - name: Keep Running
-        run: |
-          while true; do
-            sleep 300
-            echo "🟢 Active - $(date +%H:%M:%S)"
-          done
+        run: sleep 3600
