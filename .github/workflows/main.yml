@@ -1,171 +1,113 @@
-name: Debian 12 RDP + SSH with Tailscale
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  debian-rdp-ssh:
-    runs-on: ubuntu-latest
-    container:
-      image: debian:bookworm-slim
-      options: --privileged
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Update system and install dependencies
+      - name: Configure Core RDP Settings
         run: |
-          apt-get update
-          apt-get install -y sudo curl wget openssh-server netcat
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Install desktop environment
-        run: |
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 \
-            xfce4-goodies \
-            xorg \
-            xrdp \
-            firefox-esr \
-            dbus-x11
-
-      - name: Create user and generate passwords
-        run: |
-          # Generate secure passwords
-          USER_PASSWORD=$(openssl rand -base64 12 | tr -d '/+' | cut -c1-12)
-          echo "USER_PASSWORD=$USER_PASSWORD" >> $GITHUB_ENV
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
           
-          # Create user
-          useradd -m -s /bin/bash debianuser
-          echo "debianuser:$USER_PASSWORD" | chpasswd
-          usermod -a -G sudo debianuser
-          
-          # Setup RDP session
-          echo 'xfce4-session' > /home/debianuser/.xsession
-          chown debianuser:debianuser /home/debianuser/.xsession
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-      - name: Configure SSH server
-        run: |
-          # Generate SSH keys
-          ssh-keygen -A
-          
-          # Configure SSH
-          echo "Port 2222" >> /etc/ssh/sshd_config
-          echo "PermitRootLogin no" >> /etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
-          echo "X11Forwarding yes" >> /etc/ssh/sshd_config
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-      - name: Configure XRDP
+      - name: Create RDP User with Secure Password
         run: |
-          cat > /etc/xrdp/startwm.sh << 'EOF'
-#!/bin/bash
-if [ -r /etc/default/locale ]; then
-  . /etc/default/locale
-  export LANG LANGUAGE
-fi
-startxfce4
-EOF
-          chmod +x /etc/xrdp/startwm.sh
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Start Tailscale and get IP
+      - name: Establish Tailscale Connection
         run: |
-          # Start tailscaled
-          tailscaled --state=mem: &
-          sleep 10
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Connect to Tailscale
-          tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=debian12-rdp-ssh-$GITHUB_RUN_ID
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
           
-          # Get IP
-          TS_IP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-          echo "✅ Tailscale IP: $TS_IP"
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Start services
+      - name: Maintain Connection
         run: |
-          # Start DBUS
-          dbus-daemon --system --fork
-          sleep 2
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
           
-          # Start SSH
-          /usr/sbin/sshd -p 2222 &
-          sleep 2
-          
-          # Start RDP
-          xrdp-sesman &
-          sleep 2
-          xrdp &
-          sleep 5
-          
-          # Verify services
-          echo "🔍 Checking services..."
-          if ps aux | grep -q [s]shd; then
-            echo "✅ SSH server running on port 2222"
-          else
-            echo "❌ SSH server not running"
-          fi
-          
-          if ps aux | grep -q [x]rdp; then
-            echo "✅ RDP server running on port 3389"
-          else
-            echo "❌ RDP server not running"
-          fi
-
-      - name: Display connection information
-        run: |
-          echo ""
-          echo "=================================================="
-          echo "🖥️  DEBIAN 12 RDP + SSH - READY!"
-          echo "=================================================="
-          echo "📍 Tailscale IP: $TAILSCALE_IP"
-          echo "👤 Username: debianuser"
-          echo "🔑 Password: $USER_PASSWORD"
-          echo ""
-          echo "🔌 RDP Connection (Port 3389):"
-          echo "rdesktop -u debianuser -p $USER_PASSWORD $TAILSCALE_IP"
-          echo "OR"
-          echo "xfreerdp /u:debianuser /p:$USER_PASSWORD /v:$TAILSCALE_IP"
-          echo ""
-          echo "🖧 SSH Connection (Port 2222):"
-          echo "ssh -p 2222 debianuser@$TAILSCALE_IP"
-          echo ""
-          echo "📁 X11 Forwarding via SSH:"
-          echo "ssh -X -p 2222 debianuser@$TAILSCALE_IP"
-          echo ""
-          echo "🐧 OS: Debian 12 (Bookworm)"
-          echo "🖼️  Desktop: XFCE"
-          echo "🌐 Browser: Firefox ESR"
-          echo "=================================================="
-          echo ""
-
-      - name: Keep session alive
-        run: |
-          echo "🔄 Session active for 1 hour. Monitoring services..."
-          COUNTER=0
-          while [ $COUNTER -lt 72 ]; do
-            MINUTES=$((COUNTER * 5))
-            
-            # Check services
-            SSH_RUNNING=$(ps aux | grep -q [s]shd && echo "✅" || echo "❌")
-            RDP_RUNNING=$(ps aux | grep -q [x]rdp && echo "✅" || echo "❌")
-            TAILSCALE_RUNNING=$(tailscale status >/dev/null 2>&1 && echo "✅" || echo "❌")
-            
-            echo "[${MINUTES}m] Services: SSH:${SSH_RUNNING} RDP:${RDP_RUNNING} Tailscale:${TAILSCALE_RUNNING}"
-            
-            # Restart services if needed
-            if ! ps aux | grep -q [s]shd; then
-              echo "🔄 Restarting SSH server..."
-              /usr/sbin/sshd -p 2222 &
-            fi
-            
-            if ! ps aux | grep -q [x]rdp; then
-              echo "🔄 Restarting RDP server..."
-              xrdp-sesman &
-              sleep 2
-              xrdp &
-            fi
-            
-            sleep 300
-            COUNTER=$((COUNTER + 1))
-          done
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
